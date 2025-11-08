@@ -1,6 +1,7 @@
 #define VULKAN_HPP_DISPATCH_LOADER_DYNAMIC 1
 #include <string>
 #include <iostream>
+#include <vector>
 #include <vulkan/vulkan.hpp>
 #include <GLFW/glfw3.h>
 #include "image.hpp"
@@ -180,7 +181,7 @@ int main()
             {4, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eCompute},
         };
 
-        // Create kernels
+        // Create kernels, use shaders
         ComputeKernel externalForceKernel{ *device, "shader/externalForce.comp", externalForceKernelBindings, *descPool, sizeof(PushConstants) };
         ComputeKernel advectKernel{ *device, "shader/advect.comp", advectKernelBindings, *descPool };
         ComputeKernel divergenceKernel{ *device, "shader/divergence.comp", divergenceKernelBindings, *descPool };
@@ -200,6 +201,10 @@ int main()
         renderKernel.updateDescriptorSet(3, 1, pressureImage1);
         renderKernel.updateDescriptorSet(4, 1, velocityImage0);
 
+        // Create synchronization objects (moved outside the loop)
+        vk::UniqueSemaphore imageAvailableSemaphore = device->createSemaphoreUnique(vk::SemaphoreCreateInfo{});
+        vk::UniqueSemaphore renderFinishedSemaphore = device->createSemaphoreUnique(vk::SemaphoreCreateInfo{});
+
         // Main loop
         PushConstants pushConstants{ {0.0f, 0.0f}, {0.0f, 0.0f} };
         while (!glfwWindowShouldClose(window)) {
@@ -214,16 +219,16 @@ int main()
             pushConstants.mousePosition[1] = static_cast<float>(ypos);
 
             // Acquire next image
-            vk::UniqueSemaphore semaphore = device->createSemaphoreUnique(vk::SemaphoreCreateInfo{});
-            uint32_t imageIndex = device->acquireNextImageKHR(*swapchain, UINT64_MAX, *semaphore).value;
+            uint32_t imageIndex = device->acquireNextImageKHR(*swapchain, UINT64_MAX, *imageAvailableSemaphore).value;
             vk::Image swapchainImage = swapchainImages[imageIndex];
 
-            // Dispatch compute shader
+            // Record and dispatch compute shader
             commandBuffer->begin(vk::CommandBufferBeginInfo{});
             externalForceKernel.run(*commandBuffer, width, height, &pushConstants);
             advectKernel.run(*commandBuffer, width, height);
             divergenceKernel.run(*commandBuffer, width, height);
 
+            // Copy region for image operations
             vk::ImageCopy copyRegion;
             copyRegion.setSrcSubresource({ vk::ImageAspectFlagBits::eColor, 0, 0, 1 });
             copyRegion.setDstSubresource({ vk::ImageAspectFlagBits::eColor, 0, 0, 1 });
@@ -233,46 +238,57 @@ int main()
             for (int i = 0; i < iteration; i++) {
                 pressureKernel.run(*commandBuffer, width, height);
 
-                // Copy render image
-                //// pressureImage1 -> pressureImage0
+                // Copy pressure image: pressureImage1 -> pressureImage0
                 setImageLayout(*commandBuffer, *pressureImage1.image, vk::ImageLayout::eGeneral, vk::ImageLayout::eTransferSrcOptimal);
                 setImageLayout(*commandBuffer, *pressureImage0.image, vk::ImageLayout::eGeneral, vk::ImageLayout::eTransferDstOptimal);
                 commandBuffer->copyImage(*pressureImage1.image, vk::ImageLayout::eTransferSrcOptimal,
-                                         *pressureImage0.image, vk::ImageLayout::eTransferDstOptimal, copyRegion);
+                    *pressureImage0.image, vk::ImageLayout::eTransferDstOptimal, copyRegion);
                 setImageLayout(*commandBuffer, *pressureImage1.image, vk::ImageLayout::eTransferSrcOptimal, vk::ImageLayout::eGeneral);
                 setImageLayout(*commandBuffer, *pressureImage0.image, vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eGeneral);
             }
 
             renderKernel.run(*commandBuffer, width, height);
 
-            // Copy render image
-            //// render -> swapchain
+            // Copy render image to swapchain
             setImageLayout(*commandBuffer, *renderImage.image, vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferSrcOptimal);
             setImageLayout(*commandBuffer, swapchainImage, vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal);
             commandBuffer->copyImage(*renderImage.image, vk::ImageLayout::eTransferSrcOptimal,
-                                     swapchainImage, vk::ImageLayout::eTransferDstOptimal, copyRegion);
+                swapchainImage, vk::ImageLayout::eTransferDstOptimal, copyRegion);
             setImageLayout(*commandBuffer, *renderImage.image, vk::ImageLayout::eTransferSrcOptimal, vk::ImageLayout::eGeneral);
             setImageLayout(*commandBuffer, swapchainImage, vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::ePresentSrcKHR);
 
             commandBuffer->end();
 
-            // Submit command buffer
+            // Submit command buffer with proper synchronization
+            std::vector<vk::PipelineStageFlags> waitStages = { vk::PipelineStageFlagBits::eComputeShader };
             vk::SubmitInfo submitInfo;
+            submitInfo.setWaitSemaphores(*imageAvailableSemaphore);        // get compute results
+            submitInfo.setWaitDstStageMask(waitStages);                    // wait stage
             submitInfo.setCommandBuffers(*commandBuffer);
-            queue.submit(submitInfo);
-            queue.waitIdle();
+            submitInfo.setSignalSemaphores(*renderFinishedSemaphore);      // render done
+
+            queue.submit(submitInfo, {});
 
             // Present image
             vk::PresentInfoKHR presentInfo;
+            presentInfo.setWaitSemaphores(*renderFinishedSemaphore);
             presentInfo.setSwapchains(*swapchain);
             presentInfo.setImageIndices(imageIndex);
+
             if (queue.presentKHR(presentInfo) != vk::Result::eSuccess) {
                 throw std::runtime_error("Failed to present.");
             }
+
+            queue.waitIdle();
         }
+
+        // Cleanup before exit
+        queue.waitIdle();
         glfwDestroyWindow(window);
         glfwTerminate();
-    } catch (const std::exception& e) {
+    }
+    catch (const std::exception& e) {
         std::cerr << e.what() << std::endl;
     }
 }
+
